@@ -1,15 +1,20 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../models/chat_message.dart';
 import '../models/chat_profile.dart';
+import '../models/secure_channel_state.dart';
 import '../services/bluetooth_chat_service.dart';
 import '../services/chat_storage_service.dart';
+import '../services/identity_service.dart';
 import '../services/security_service.dart';
 import 'profile_screen.dart';
+import 'safety_verification_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -22,6 +27,7 @@ class _ChatScreenState extends State<ChatScreen> {
   late final BluetoothChatService _service;
   late final ChatStorageService _storage;
   late final SecurityService _security;
+  late final IdentityService _identity;
   late ChatProfile _myProfile;
   late ChatProfile _peerProfile;
 
@@ -29,9 +35,14 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   late final StreamSubscription<IncomingTransfer> _incomingTransferSubscription;
   late final StreamSubscription<IncomingTextMessage> _incomingTextSubscription;
+  late final StreamSubscription<SecureChannelState> _channelStateSubscription;
+  late final StreamSubscription<TrustPromptEvent> _trustPromptSubscription;
   bool _isScanning = false;
   bool _isConnecting = false;
   bool _isSendingFile = false;
+  SecretKey? _localStorageKey;
+  SecureChannelState _channelState = SecureChannelState.idle;
+  Uint8List? _myIdentityPublicKey;
 
   @override
   void initState() {
@@ -39,6 +50,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _service = BluetoothChatService();
     _storage = ChatStorageService();
     _security = SecurityService();
+    _identity = IdentityService();
     _myProfile = const ChatProfile(id: 'me', name: 'You', isMe: true);
     _peerProfile = const ChatProfile(id: 'peer', name: 'Ava', isMe: false);
 
@@ -46,6 +58,10 @@ class _ChatScreenState extends State<ChatScreen> {
         _service.incomingTransfers.listen(_handleIncomingTransfer);
     _incomingTextSubscription =
         _service.incomingTextMessages.listen(_handleIncomingText);
+    _channelStateSubscription =
+        _service.channelStateChanges.listen(_handleChannelStateChange);
+    _trustPromptSubscription =
+        _service.trustPrompts.listen(_handleTrustPrompt);
     _bootstrap();
   }
 
@@ -54,16 +70,18 @@ class _ChatScreenState extends State<ChatScreen> {
     _messageController.dispose();
     _incomingTransferSubscription.cancel();
     _incomingTextSubscription.cancel();
+    _channelStateSubscription.cancel();
+    _trustPromptSubscription.cancel();
     _service.dispose();
     super.dispose();
   }
 
   Future<void> _bootstrap() async {
     await _storage.initialize();
-    final passphrase = await _security.getPassphrase();
-    _service.setPassphrase(passphrase);
+    _localStorageKey = await _security.getLocalStorageKey();
+    _myIdentityPublicKey = await _identity.getPublicKeyBytes();
 
-    final persistedMessages = await _storage.loadMessages(passphrase);
+    final persistedMessages = await _storage.loadMessages(_localStorageKey!);
     if (!mounted) {
       return;
     }
@@ -91,8 +109,64 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _persistMessages() async {
-    final passphrase = await _security.getPassphrase();
-    await _storage.saveMessages(_messages, passphrase);
+    final key = _localStorageKey ??= await _security.getLocalStorageKey();
+    await _storage.saveMessages(_messages, key);
+  }
+
+  void _handleChannelStateChange(SecureChannelState state) {
+    if (!mounted) {
+      return;
+    }
+    setState(() => _channelState = state);
+
+    if (state == SecureChannelState.established) {
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            id: DateTime.now().toIso8601String(),
+            text:
+                'Защищённое соединение установлено с ${_service.connectedDevice?.name ?? 'устройством'}',
+            senderName: 'System',
+            isMine: false,
+            createdAt: DateTime.now(),
+            type: MessageType.text,
+          ),
+        );
+      });
+      _persistMessages();
+    }
+  }
+
+  Future<void> _handleTrustPrompt(TrustPromptEvent event) async {
+    if (!mounted) {
+      return;
+    }
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text(event.isChanged ? 'Ключ устройства изменился' : 'Новое устройство'),
+        content: Text(
+          event.isChanged
+              ? 'У устройства "${event.displayName ?? event.bleId}" изменился ключ безопасности. '
+                  'Это может значить переустановку приложения — или атаку. Продолжить, только если вы уверены.'
+              : 'Устройство "${event.displayName ?? event.bleId}" подключается впервые. Доверять и начать общение?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(event.isChanged ? 'Всё равно продолжить' : 'Доверять'),
+          ),
+        ],
+      ),
+    );
+
+    await _service.respondToTrustPrompt(accepted ?? false);
   }
 
   Future<void> _loadNearbyDevices() async {
@@ -109,20 +183,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _service.connectToDevice(device);
 
     if (mounted) {
-      setState(() {
-        _isConnecting = false;
-        _messages.add(
-          ChatMessage(
-            id: DateTime.now().toIso8601String(),
-            text: 'Подключились к ${device.name}',
-            senderName: 'System',
-            isMine: false,
-            createdAt: DateTime.now(),
-            type: MessageType.text,
-          ),
-        );
-      });
-      await _persistMessages();
+      setState(() => _isConnecting = false);
     }
   }
 
@@ -298,6 +359,27 @@ class _ChatScreenState extends State<ChatScreen> {
         title: const Text('Nearby Chat',
             style: TextStyle(fontWeight: FontWeight.w700)),
         actions: [
+          if (_channelState == SecureChannelState.established &&
+              _myIdentityPublicKey != null)
+            IconButton(
+              onPressed: () {
+                final peerKey = _service.connectedPeerIdentityPublicKey;
+                final myKey = _myIdentityPublicKey;
+                if (peerKey == null || myKey == null) {
+                  return;
+                }
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => SafetyVerificationScreen(
+                      myIdentityPublicKey: myKey,
+                      peerIdentityPublicKey: peerKey,
+                    ),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.verified_user_outlined),
+              tooltip: 'Проверить безопасность',
+            ),
           IconButton(
             onPressed: _pickAvatar,
             icon: const Icon(Icons.account_circle_outlined),
@@ -344,9 +426,6 @@ class _ChatScreenState extends State<ChatScreen> {
                     profile: _myProfile,
                     onProfileChanged: (profile) {
                       setState(() => _myProfile = profile);
-                    },
-                    onPassphraseChanged: (passphrase) {
-                      _service.setPassphrase(passphrase);
                     },
                   ),
                 ),
@@ -643,7 +722,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             borderRadius: BorderRadius.circular(18),
                           ),
                           child: IconButton(
-                            onPressed: () => _sendMessage(),
+                            onPressed: _channelState == SecureChannelState.established
+                                ? () => _sendMessage()
+                                : null,
                             icon: const Icon(Icons.send_rounded),
                             color: Colors.white,
                           ),
