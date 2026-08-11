@@ -172,19 +172,36 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadNearbyDevices() async {
     setState(() => _isScanning = true);
-    await _service.initialize();
-    await _service.startScanning();
-    if (mounted) {
-      setState(() => _isScanning = false);
+    try {
+      await _service.initialize();
+      await _service.startScanning();
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось найти устройства: $error')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isScanning = false);
+      }
     }
   }
 
   Future<void> _connectToDevice(BluetoothDeviceInfo device) async {
     setState(() => _isConnecting = true);
-    await _service.connectToDevice(device);
-
-    if (mounted) {
-      setState(() => _isConnecting = false);
+    try {
+      await _service.connectToDevice(device);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось подключиться: $error')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isConnecting = false);
+      }
     }
   }
 

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -115,6 +116,40 @@ class BluetoothChatService {
   // on stale/nulled state.
   int _connectionEpoch = 0;
 
+  // Outbound writes/notifies serialize through this chain so two overlapping
+  // sends (e.g. a double-tapped send, or sendFile racing sendMessage) can
+  // never interleave their chunks on the wire.
+  Future<void> _txChain = Future<void>.value();
+
+  // Received frames are dispatched to SecureChannelService.receiveFrame
+  // through this chain, one at a time in arrival order, so two frames
+  // arriving close together can't both read the same AEAD receive counter
+  // before either increments it.
+  Future<void> _rxChain = Future<void>.value();
+
+  // Pausing/resuming the peripheral+central roles (advertise/host GATT
+  // server, scan) serializes through this chain so a fast state flip (e.g.
+  // handshaking immediately followed by failed) can't let a resume and a
+  // pause run out of order and leave the device in neither state.
+  Future<void> _roleChain = Future<void>.value();
+
+  // Guards the crypto-handshake phase only (HELLO/RESPONSE/FINISHED). Armed
+  // when a session enters `handshaking`, disarmed as soon as the handshake
+  // itself completes (successfully or not) or the session tears down. Does
+  // not cover the human trust-prompt wait that can follow a completed
+  // handshake — that's bounded by user interaction, not this timer.
+  Timer? _handshakeWatchdog;
+  static const Duration _handshakeTimeout = Duration(seconds: 30);
+
+  // Tracks whether the last attempt to host a GATT server + advertise
+  // succeeded, so a failure (unsupported hardware, denied advertise
+  // permission) is observable instead of silently degrading to
+  // central-only with no signal anywhere.
+  bool _peripheralRoleActive = false;
+  bool get isPeripheralRoleActive => _peripheralRoleActive;
+
+  bool _disposed = false;
+
   StreamSubscription<DiscoveredEventArgs>? _discoverySubscription;
   StreamSubscription<GATTCharacteristicNotifiedEventArgs>? _notifiedSubscription;
   StreamSubscription<GATTCharacteristicWriteRequestedEventArgs>?
@@ -179,6 +214,21 @@ class BluetoothChatService {
       _downloadsDir ??= await getApplicationDocumentsDirectory();
       await _trustStore.initialize();
 
+      // The rewrite from flutter_blue_plus dropped adapter-state handling
+      // (the old code called FlutterBluePlus.turnOn()). There's no
+      // equivalent "request the adapter turn on" call in this plugin, but
+      // failing here with a clear message — instead of letting
+      // startDiscovery() below throw an opaque plugin error — means the
+      // caller gets a catchable, understandable failure instead of a silent
+      // stuck "scanning" state.
+      final adapterState = _centralManager.state;
+      if (adapterState != BluetoothLowEnergyState.poweredOn) {
+        throw StateError(
+          'Bluetooth is not available (adapter state: $adapterState). '
+          'Turn Bluetooth on and try again.',
+        );
+      }
+
       _localCharacteristic ??= GATTCharacteristic.mutable(
         uuid: _characteristicUUID,
         properties: const [
@@ -205,7 +255,7 @@ class BluetoothChatService {
       _centralManagerConnectionSubscription = _centralManager.connectionStateChanged
           .listen(_handleCentralManagerConnectionStateChanged);
 
-      await _startHostingAndDiscovery();
+      await _enqueueRoleTransition(_startHostingAndDiscovery);
 
       _initialized = true;
     } catch (_) {
@@ -214,6 +264,16 @@ class BluetoothChatService {
     } finally {
       _initializing = null;
     }
+  }
+
+  // Runs [action] (a pause or resume of the peripheral/central roles) after
+  // any previously-queued role transition has finished, so pause/resume
+  // calls triggered by fast state flips or a manual refresh can never run
+  // concurrently or complete out of order.
+  Future<void> _enqueueRoleTransition(Future<void> Function() action) {
+    final future = _roleChain.then((_) => action());
+    _roleChain = future.catchError((_) {});
+    return future;
   }
 
   Future<void> _startHostingAndDiscovery() async {
@@ -235,9 +295,18 @@ class BluetoothChatService {
       await _peripheralManager.startAdvertising(
         Advertisement(name: _localDisplayName, serviceUUIDs: [_serviceUUID]),
       );
-    } catch (_) {
-      // Peripheral/advertising role unavailable on this device — continue
-      // to central-role discovery below regardless.
+      _peripheralRoleActive = true;
+    } catch (e) {
+      // Peripheral/advertising role unavailable on this device (unsupported
+      // hardware, denied advertise permission, or an advertisement payload
+      // too large — a 128-bit service UUID alone consumes 18 of a BLE
+      // advertisement's 31 bytes, so a long display name can push this over
+      // the limit on some platforms). Not fatal to the central role, but
+      // must not be completely silent: flag it and continue to
+      // central-role discovery below regardless.
+      _peripheralRoleActive = false;
+      debugPrint(
+          'BluetoothChatService: peripheral/advertising role unavailable: $e');
     }
 
     discoveredDevices.clear();
@@ -259,6 +328,7 @@ class BluetoothChatService {
     } catch (_) {
       // Already stopped — safe to ignore.
     }
+    _peripheralRoleActive = false;
   }
 
   void _handleDiscovered(DiscoveredEventArgs args) {
@@ -281,17 +351,15 @@ class BluetoothChatService {
     }
   }
 
+  // Restarts both roles — discovery *and* advertising/hosting — not just
+  // discovery, so the user-facing "refresh" action can also recover a
+  // peripheral role that silently died earlier (see _startHostingAndDiscovery).
   Future<void> startScanning() async {
     if (!isChannelAvailable(_channelState)) {
       return;
     }
     discoveredDevices.clear();
-    try {
-      await _centralManager.stopDiscovery();
-    } catch (_) {
-      // Not currently discovering — safe to ignore.
-    }
-    await _centralManager.startDiscovery(serviceUUIDs: [_serviceUUID]);
+    await _enqueueRoleTransition(_startHostingAndDiscovery);
   }
 
   Future<void> connectToDevice(BluetoothDeviceInfo deviceInfo) async {
@@ -306,70 +374,105 @@ class BluetoothChatService {
     _connectionEpoch++;
     _pendingDeviceInfo = deviceInfo;
     _setChannelState(SecureChannelState.handshaking);
+    _armHandshakeWatchdog();
 
-    await _centralManager.connect(peripheral);
-    final services = await _centralManager.discoverGATT(peripheral);
+    // Any BLE call below (connect timeout, peer out of range, GATT error,
+    // handshake I/O failure) is a routine condition, not a programming
+    // error — but left unhandled it would propagate out of this method
+    // with the busy slot still claimed (state stuck at `handshaking`,
+    // advertising/discovery both stopped, and no disconnect event able to
+    // rescue it once `_connectedPeripheral` has been assigned). Every
+    // failure path here must go through _teardownConnection so the slot is
+    // always released.
+    try {
+      await _centralManager.connect(peripheral);
+      // Assigned as soon as the physical link exists so that any failure
+      // from this point on can be cleaned up (and the peer disconnected)
+      // by _teardownConnection.
+      _connectedPeripheral = peripheral;
 
-    GATTCharacteristic? characteristic;
-    for (final service in services) {
-      if (service.uuid != _serviceUUID) {
-        continue;
-      }
-      for (final candidate in service.characteristics) {
-        if (candidate.uuid == _characteristicUUID) {
-          characteristic = candidate;
+      final services = await _centralManager.discoverGATT(peripheral);
+
+      GATTCharacteristic? characteristic;
+      for (final service in services) {
+        if (service.uuid != _serviceUUID) {
+          continue;
+        }
+        for (final candidate in service.characteristics) {
+          if (candidate.uuid == _characteristicUUID) {
+            characteristic = candidate;
+          }
         }
       }
+
+      if (characteristic == null) {
+        await _teardownConnection(resultingState: SecureChannelState.failed);
+        return;
+      }
+
+      _remoteCharacteristic = characteristic;
+
+      await _centralManager.setCharacteristicNotifyState(
+        peripheral,
+        characteristic,
+        state: true,
+      );
+
+      connectedDevice = BluetoothDeviceInfo(
+        id: deviceInfo.id,
+        name: deviceInfo.name,
+        isConnected: true,
+        peripheral: peripheral,
+      );
+
+      _frameCodec = BluetoothFrameCodec(onFrame: _enqueueReceivedFrame);
+
+      _secureChannel = SecureChannelService(
+        identityService: _identityService,
+        isInitiator: true,
+        sendFrame: (type, payload) =>
+            _sendAsCentral(BluetoothFrameCodec.encode(type, payload)),
+        onHandshakeComplete: (result) => _onHandshakeComplete(result),
+        onHandshakeFailed: (reason) => unawaited(
+            _teardownConnection(resultingState: SecureChannelState.failed)),
+        onData: (data) => _handleDecryptedData(data),
+        onChannelError: (reason) => unawaited(
+            _teardownConnection(resultingState: SecureChannelState.failed)),
+      );
+
+      await _secureChannel!.start();
+    } catch (_) {
+      await _teardownConnection(resultingState: SecureChannelState.failed);
+      rethrow;
     }
-
-    if (characteristic == null) {
-      _setChannelState(SecureChannelState.failed);
-      await _centralManager.disconnect(peripheral);
-      return;
-    }
-
-    _connectedPeripheral = peripheral;
-    _remoteCharacteristic = characteristic;
-
-    await _centralManager.setCharacteristicNotifyState(
-      peripheral,
-      characteristic,
-      state: true,
-    );
-
-    connectedDevice = BluetoothDeviceInfo(
-      id: deviceInfo.id,
-      name: deviceInfo.name,
-      isConnected: true,
-      peripheral: peripheral,
-    );
-
-    _frameCodec = BluetoothFrameCodec(onFrame: (type, payload) {
-      _secureChannel?.receiveFrame(type, payload);
-    });
-
-    _secureChannel = SecureChannelService(
-      identityService: _identityService,
-      isInitiator: true,
-      sendFrame: (type, payload) =>
-          _sendAsCentral(BluetoothFrameCodec.encode(type, payload)),
-      onHandshakeComplete: (result) => _onHandshakeComplete(result),
-      onHandshakeFailed: (reason) => unawaited(
-          _teardownConnection(resultingState: SecureChannelState.failed)),
-      onData: (data) => _handleDecryptedData(data),
-      onChannelError: (reason) => unawaited(
-          _teardownConnection(resultingState: SecureChannelState.failed)),
-    );
-
-    await _secureChannel!.start();
   }
 
-  Future<void> _sendAsCentral(Uint8List bytes) async {
+  // Enqueues a write onto the shared outbound chain instead of writing
+  // immediately, so two overlapping sends (handshake frames racing a data
+  // frame, or two overlapping sendMessage/sendFile calls) can't interleave
+  // their chunks on the wire. The peripheral/characteristic are captured
+  // now (not re-read from the instance fields when the queued write
+  // actually runs) so a queued write always targets the peer it was
+  // written for, even if a new session has since reassigned those fields.
+  Future<void> _sendAsCentral(Uint8List bytes) {
     final peripheral = _connectedPeripheral;
     final characteristic = _remoteCharacteristic;
     if (peripheral == null || characteristic == null) {
-      return;
+      return Future<void>.value();
     }
+    final future = _txChain
+        .then((_) => _writeCentralChunks(peripheral, characteristic, bytes));
+    // Keep the chain alive even if this particular write fails, so a later
+    // send isn't permanently blocked by one failed write.
+    _txChain = future.catchError((_) {});
+    return future;
+  }
+
+  Future<void> _writeCentralChunks(
+    Peripheral peripheral,
+    GATTCharacteristic characteristic,
+    Uint8List bytes,
+  ) async {
     final maxLength = await _centralManager.getMaximumWriteLength(
       peripheral,
       type: GATTCharacteristicWriteType.withoutResponse,
@@ -438,8 +541,14 @@ class BluetoothChatService {
       return;
     }
 
-    await _peripheralManager.respondWriteRequest(args.request);
+    // feed() is synchronous and dispatches to the frame codec's internal
+    // buffer immediately. It must run before the `respondWriteRequest`
+    // await below — the async gap there means two overlapping write
+    // requests aren't serialized by the stream, so if feed() ran after the
+    // await, two in-flight writes could feed in whichever order their
+    // response futures happened to resolve, reordering the payload.
     _frameCodec?.feed(args.request.value);
+    await _peripheralManager.respondWriteRequest(args.request);
   }
 
   void _startPeripheralSession(Central central) {
@@ -454,10 +563,9 @@ class BluetoothChatService {
     connectedDevice = deviceInfo;
 
     _setChannelState(SecureChannelState.handshaking);
+    _armHandshakeWatchdog();
 
-    _frameCodec = BluetoothFrameCodec(onFrame: (type, payload) {
-      _secureChannel?.receiveFrame(type, payload);
-    });
+    _frameCodec = BluetoothFrameCodec(onFrame: _enqueueReceivedFrame);
 
     _secureChannel = SecureChannelService(
       identityService: _identityService,
@@ -473,11 +581,26 @@ class BluetoothChatService {
     );
   }
 
-  Future<void> _sendAsPeripheral(Uint8List bytes) async {
+  // See _sendAsCentral for why this enqueues onto the shared _txChain
+  // instead of writing immediately, and why the central/characteristic are
+  // captured now rather than re-read when the queued write runs.
+  Future<void> _sendAsPeripheral(Uint8List bytes) {
     final central = _connectedCentral;
-    if (central == null) {
-      return;
+    final characteristic = _localCharacteristic;
+    if (central == null || characteristic == null) {
+      return Future<void>.value();
     }
+    final future =
+        _txChain.then((_) => _writePeripheralChunks(central, characteristic, bytes));
+    _txChain = future.catchError((_) {});
+    return future;
+  }
+
+  Future<void> _writePeripheralChunks(
+    Central central,
+    GATTCharacteristic characteristic,
+    Uint8List bytes,
+  ) async {
     final maxLength = await _peripheralManager.getMaximumNotifyLength(central);
     var offset = 0;
     while (offset < bytes.length) {
@@ -485,7 +608,7 @@ class BluetoothChatService {
           (offset + maxLength < bytes.length) ? offset + maxLength : bytes.length;
       await _peripheralManager.notifyCharacteristic(
         central,
-        _localCharacteristic!,
+        characteristic,
         value: bytes.sublist(offset, end),
       );
       offset = end;
@@ -505,6 +628,15 @@ class BluetoothChatService {
   }
 
   Future<void> _onHandshakeComplete(HandshakeResult result) async {
+    if (_disposed) {
+      return;
+    }
+    // Reaching this callback means the crypto handshake itself (HELLO/
+    // RESPONSE/FINISHED) succeeded, so the handshake watchdog's job is
+    // done — the remaining trust-prompt wait, if any, is bounded by user
+    // interaction, not by this timer.
+    _disarmHandshakeWatchdog();
+
     // Captured so that if the session this handshake belongs to is torn
     // down (peer disconnects, teardown runs) while we're suspended on an
     // `await` below, we can tell and bail out instead of resurrecting a
@@ -566,15 +698,22 @@ class BluetoothChatService {
   }
 
   void _setChannelState(SecureChannelState state) {
+    // dispose() closes the stream controllers; a teardown that was already
+    // in flight when dispose() ran (e.g. launched from a disconnect event
+    // moments earlier) must not reach `_channelStateController.add()` after
+    // that or it throws a StateError on the closed controller.
+    if (_disposed) {
+      return;
+    }
     final wasAvailable = isChannelAvailable(_channelState);
     _channelState = state;
     _channelStateController.add(state);
 
     final isAvailable = isChannelAvailable(state);
     if (wasAvailable && !isAvailable) {
-      unawaited(_pauseHostingAndDiscovery());
+      unawaited(_enqueueRoleTransition(_pauseHostingAndDiscovery));
     } else if (!wasAvailable && isAvailable) {
-      unawaited(_startHostingAndDiscovery());
+      unawaited(_enqueueRoleTransition(_startHostingAndDiscovery));
     }
   }
 
@@ -604,7 +743,7 @@ class BluetoothChatService {
   }
 
   void _handleDecryptedData(Uint8List inner) {
-    if (inner.isEmpty) {
+    if (_disposed || inner.isEmpty) {
       return;
     }
     final innerType = inner[0];
@@ -634,6 +773,9 @@ class BluetoothChatService {
     final filePath = '${_downloadsDir!.path}/$safeName';
     final file = File(filePath);
     await file.writeAsBytes(fileBytes, flush: true);
+    if (_disposed) {
+      return;
+    }
     _incomingTransferController
         .add(IncomingTransfer(fileName: safeName, filePath: filePath));
   }
@@ -648,6 +790,7 @@ class BluetoothChatService {
     // epoch and bails out instead of trying to establish or re-tear-down a
     // session that no longer exists.
     _connectionEpoch++;
+    _disarmHandshakeWatchdog();
     _pendingTrustDecision?.complete(false);
     _pendingTrustDecision = null;
 
@@ -681,6 +824,15 @@ class BluetoothChatService {
   }
 
   Future<void> dispose() async {
+    // Set first, before anything else: an already-in-flight
+    // unawaited(_teardownConnection()) (e.g. launched a moment earlier by a
+    // disconnect event) can still be running concurrently with dispose().
+    // _setChannelState checks this flag and no-ops instead of calling
+    // `.add()` on a controller dispose() is about to close, which would
+    // otherwise throw a StateError.
+    _disposed = true;
+    _disarmHandshakeWatchdog();
+
     _pendingTrustDecision?.complete(false);
     _pendingTrustDecision = null;
 
@@ -698,6 +850,18 @@ class BluetoothChatService {
         // Already disconnected — safe to ignore.
       }
     }
+    // Also disconnect the remote central if we were acting as the
+    // responder (peripheral role) — previously only the central-role link
+    // was disconnected here, leaving a connected central talking to a
+    // write handler whose subscription had just been cancelled.
+    final central = _connectedCentral;
+    if (central != null) {
+      try {
+        await _peripheralManager.disconnect(central);
+      } catch (_) {
+        // Already disconnected — safe to ignore.
+      }
+    }
 
     try {
       await _centralManager.stopDiscovery();
@@ -709,10 +873,59 @@ class BluetoothChatService {
     } catch (_) {
       // Not advertising — safe to ignore.
     }
+    // Previously left the GATT service published after dispose(), so
+    // leaving the chat screen while acting as the responder left the
+    // service visible/connectable with nothing left to handle it.
+    try {
+      await _peripheralManager.removeAllServices();
+    } catch (_) {
+      // Nothing published, or unsupported — safe to ignore.
+    }
 
     await _incomingTextController.close();
     await _incomingTransferController.close();
     await _channelStateController.close();
     await _trustPromptController.close();
+  }
+
+  void _armHandshakeWatchdog() {
+    _handshakeWatchdog?.cancel();
+    _handshakeWatchdog = Timer(_handshakeTimeout, () {
+      // A stuck or hostile peer can otherwise squat the single connection
+      // slot indefinitely: nothing else times out a handshake that never
+      // completes, and recovery would depend entirely on the remote side
+      // choosing to disconnect.
+      unawaited(
+          _teardownConnection(resultingState: SecureChannelState.failed));
+    });
+  }
+
+  void _disarmHandshakeWatchdog() {
+    _handshakeWatchdog?.cancel();
+    _handshakeWatchdog = null;
+  }
+
+  // Dispatches a received frame onto the shared inbound chain instead of
+  // calling SecureChannelService.receiveFrame directly, so two frames
+  // arriving close together are processed one at a time in arrival order
+  // rather than both reading the same AEAD receive counter before either
+  // increments it. The channel and epoch are captured now (at the moment
+  // the frame actually arrived) so a frame queued by one session can never
+  // be delivered to a different session's SecureChannelService if a
+  // teardown and a new session both happen before this frame's turn comes
+  // up in the queue.
+  void _enqueueReceivedFrame(FrameType type, Uint8List payload) {
+    final channel = _secureChannel;
+    if (channel == null) {
+      return;
+    }
+    final epoch = _connectionEpoch;
+    final future = _rxChain.then((_) async {
+      if (epoch != _connectionEpoch) {
+        return;
+      }
+      await channel.receiveFrame(type, payload);
+    });
+    _rxChain = future.catchError((_) {});
   }
 }
