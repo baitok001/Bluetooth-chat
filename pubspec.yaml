@@ -1,0 +1,38 @@
+name: bluetooth_chat_app
+description: A simple Bluetooth-style chat app for iOS and Android with avatars.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  image_picker: ^1.0.9
+  flutter_blue_plus: ^1.35.0
+  permission_handler: ^11.0.0
+  path_provider: ^2.1.6
+  sqflite: ^2.3.3
+  flutter_secure_storage: ^9.0.0
+  encrypt: ^5.0.0
+  crypto: ^3.0.7
+  path: ^1.9.0
+
+  flutter_launcher_icons: ^0.14.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon.png"
