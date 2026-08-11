@@ -16,7 +16,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.bluetooth_chat_app"
-        minSdk = flutter.minSdkVersion
+        minSdk = 24
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName

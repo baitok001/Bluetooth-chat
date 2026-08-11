@@ -6,6 +6,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Камера нужна, чтобы отсканировать QR-код для проверки безопасности соединения</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Bluetooth нужен, чтобы находить и подключаться к устройствам поблизости для чата</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
