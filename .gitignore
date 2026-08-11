@@ -15,6 +15,9 @@ migrate_working_dir/
 # Claude Code local settings
 .claude/settings.local.json
 
+# Git worktrees used for isolated plan execution
+.worktrees/
+
 # IntelliJ related
 *.iml
 *.ipr
