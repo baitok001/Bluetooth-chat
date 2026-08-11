@@ -94,8 +94,18 @@ class BluetoothChatService {
 
   bool _initialized = false;
   String _localDisplayName = 'Nearby device';
-  late final GATTCharacteristic _localCharacteristic;
+  // Nullable (not `late final`) so a failed `initialize()` can be retried
+  // without hitting a "already initialized" LateInitializationError; built
+  // idempotently via `??=` the first time initialize() reaches this point.
+  GATTCharacteristic? _localCharacteristic;
   Directory? _downloadsDir;
+
+  // Bumped every time a connection session starts or is torn down. Lets
+  // async callbacks that were suspended mid-session (e.g. awaiting a trust
+  // prompt decision) detect that the session they belonged to no longer
+  // exists by the time they resume, so they can bail out instead of acting
+  // on stale/nulled state.
+  int _connectionEpoch = 0;
 
   StreamSubscription<DiscoveredEventArgs>? _discoverySubscription;
   StreamSubscription<GATTCharacteristicNotifiedEventArgs>? _notifiedSubscription;
@@ -129,57 +139,82 @@ class BluetoothChatService {
     if (_initialized) {
       return;
     }
-    _initialized = true;
 
-    if (Platform.isAndroid) {
-      await Permission.bluetooth.request();
-      await Permission.bluetoothScan.request();
-      await Permission.bluetoothConnect.request();
-      await Permission.bluetoothAdvertise.request();
-      await Permission.locationWhenInUse.request();
+    // `_initialized` is only flipped to true once every step below has
+    // succeeded. If anything throws (e.g. a permission request fails on an
+    // odd platform, or the trust store can't open its database), it's reset
+    // so the caller can retry by calling initialize() again from scratch
+    // instead of being permanently stuck with a half-initialized service.
+    try {
+      if (Platform.isAndroid) {
+        await Permission.bluetooth.request();
+        await Permission.bluetoothScan.request();
+        await Permission.bluetoothConnect.request();
+        await Permission.bluetoothAdvertise.request();
+        await Permission.locationWhenInUse.request();
+      }
+
+      _downloadsDir ??= await getApplicationDocumentsDirectory();
+      await _trustStore.initialize();
+
+      _localCharacteristic ??= GATTCharacteristic.mutable(
+        uuid: _characteristicUUID,
+        properties: const [
+          GATTCharacteristicProperty.write,
+          GATTCharacteristicProperty.writeWithoutResponse,
+          GATTCharacteristicProperty.notify,
+        ],
+        permissions: const [GATTCharacteristicPermission.write],
+        descriptors: const [],
+      );
+
+      await _writeRequestedSubscription?.cancel();
+      _writeRequestedSubscription = _peripheralManager.characteristicWriteRequested
+          .listen(_handleCharacteristicWriteRequested);
+      await _peripheralManagerConnectionSubscription?.cancel();
+      _peripheralManagerConnectionSubscription = _peripheralManager
+          .connectionStateChanged
+          .listen(_handlePeripheralManagerConnectionStateChanged);
+
+      await _notifiedSubscription?.cancel();
+      _notifiedSubscription =
+          _centralManager.characteristicNotified.listen(_handleCharacteristicNotified);
+      await _centralManagerConnectionSubscription?.cancel();
+      _centralManagerConnectionSubscription = _centralManager.connectionStateChanged
+          .listen(_handleCentralManagerConnectionStateChanged);
+
+      await _startHostingAndDiscovery();
+
+      _initialized = true;
+    } catch (_) {
+      _initialized = false;
+      rethrow;
     }
-
-    _downloadsDir ??= await getApplicationDocumentsDirectory();
-    await _trustStore.initialize();
-
-    _localCharacteristic = GATTCharacteristic.mutable(
-      uuid: _characteristicUUID,
-      properties: const [
-        GATTCharacteristicProperty.write,
-        GATTCharacteristicProperty.writeWithoutResponse,
-        GATTCharacteristicProperty.notify,
-      ],
-      permissions: const [GATTCharacteristicPermission.write],
-      descriptors: const [],
-    );
-
-    _writeRequestedSubscription = _peripheralManager.characteristicWriteRequested
-        .listen(_handleCharacteristicWriteRequested);
-    _peripheralManagerConnectionSubscription = _peripheralManager
-        .connectionStateChanged
-        .listen(_handlePeripheralManagerConnectionStateChanged);
-
-    _notifiedSubscription =
-        _centralManager.characteristicNotified.listen(_handleCharacteristicNotified);
-    _centralManagerConnectionSubscription = _centralManager.connectionStateChanged
-        .listen(_handleCentralManagerConnectionStateChanged);
-
-    await _startHostingAndDiscovery();
   }
 
   Future<void> _startHostingAndDiscovery() async {
-    await _peripheralManager.removeAllServices();
-    await _peripheralManager.addService(
-      GATTService(
-        uuid: _serviceUUID,
-        isPrimary: true,
-        includedServices: const [],
-        characteristics: [_localCharacteristic],
-      ),
-    );
-    await _peripheralManager.startAdvertising(
-      Advertisement(name: _localDisplayName, serviceUUIDs: [_serviceUUID]),
-    );
+    // Advertising/hosting a GATT server is the peripheral role. On a device
+    // or platform where that's unsupported, or if the advertise permission
+    // was denied, this must not take down the central role (scan+connect)
+    // with it — so failures here are swallowed and we degrade to
+    // scan-and-connect-only rather than losing both roles.
+    try {
+      await _peripheralManager.removeAllServices();
+      await _peripheralManager.addService(
+        GATTService(
+          uuid: _serviceUUID,
+          isPrimary: true,
+          includedServices: const [],
+          characteristics: [_localCharacteristic!],
+        ),
+      );
+      await _peripheralManager.startAdvertising(
+        Advertisement(name: _localDisplayName, serviceUUIDs: [_serviceUUID]),
+      );
+    } catch (_) {
+      // Peripheral/advertising role unavailable on this device — continue
+      // to central-role discovery below regardless.
+    }
 
     discoveredDevices.clear();
     await _discoverySubscription?.cancel();
@@ -244,6 +279,7 @@ class BluetoothChatService {
       throw Exception('No peripheral handle for this device');
     }
 
+    _connectionEpoch++;
     _pendingDeviceInfo = deviceInfo;
     _setChannelState(SecureChannelState.handshaking);
 
@@ -294,9 +330,11 @@ class BluetoothChatService {
       sendFrame: (type, payload) =>
           _sendAsCentral(BluetoothFrameCodec.encode(type, payload)),
       onHandshakeComplete: (result) => _onHandshakeComplete(result),
-      onHandshakeFailed: (reason) => _setChannelState(SecureChannelState.failed),
+      onHandshakeFailed: (reason) => unawaited(
+          _teardownConnection(resultingState: SecureChannelState.failed)),
       onData: (data) => _handleDecryptedData(data),
-      onChannelError: (reason) => _setChannelState(SecureChannelState.failed),
+      onChannelError: (reason) => unawaited(
+          _teardownConnection(resultingState: SecureChannelState.failed)),
     );
 
     await _secureChannel!.start();
@@ -381,6 +419,7 @@ class BluetoothChatService {
   }
 
   void _startPeripheralSession(Central central) {
+    _connectionEpoch++;
     _connectedCentral = central;
     final deviceInfo = BluetoothDeviceInfo(
       id: central.uuid.toString(),
@@ -402,9 +441,11 @@ class BluetoothChatService {
       sendFrame: (type, payload) =>
           _sendAsPeripheral(BluetoothFrameCodec.encode(type, payload)),
       onHandshakeComplete: (result) => _onHandshakeComplete(result),
-      onHandshakeFailed: (reason) => _setChannelState(SecureChannelState.failed),
+      onHandshakeFailed: (reason) => unawaited(
+          _teardownConnection(resultingState: SecureChannelState.failed)),
       onData: (data) => _handleDecryptedData(data),
-      onChannelError: (reason) => _setChannelState(SecureChannelState.failed),
+      onChannelError: (reason) => unawaited(
+          _teardownConnection(resultingState: SecureChannelState.failed)),
     );
   }
 
@@ -420,7 +461,7 @@ class BluetoothChatService {
           (offset + maxLength < bytes.length) ? offset + maxLength : bytes.length;
       await _peripheralManager.notifyCharacteristic(
         central,
-        _localCharacteristic,
+        _localCharacteristic!,
         value: bytes.sublist(offset, end),
       );
       offset = end;
@@ -440,12 +481,21 @@ class BluetoothChatService {
   }
 
   Future<void> _onHandshakeComplete(HandshakeResult result) async {
+    // Captured so that if the session this handshake belongs to is torn
+    // down (peer disconnects, teardown runs) while we're suspended on an
+    // `await` below, we can tell and bail out instead of resurrecting a
+    // dead session or acting on now-nulled state.
+    final epoch = _connectionEpoch;
+
     final identityBase64 = base64.encode(result.peerIdentityPublicKey);
     final decision = await _trustStore.evaluate(
       identityPublicKeyBase64: identityBase64,
       bleId: _pendingDeviceInfo?.id,
       displayName: _pendingDeviceInfo?.name,
     );
+    if (epoch != _connectionEpoch) {
+      return;
+    }
 
     if (decision.isNewDevice || decision.isChanged) {
       _setChannelState(decision.isChanged
@@ -463,6 +513,13 @@ class BluetoothChatService {
       ));
 
       final accepted = await completer.future;
+      if (epoch != _connectionEpoch) {
+        // The session was already torn down (e.g. the peer disconnected)
+        // while the trust prompt was outstanding. _teardownConnection()
+        // already resolved _pendingTrustDecision and reset state; there's
+        // nothing left here to establish or tear down again.
+        return;
+      }
       if (!accepted) {
         await _teardownConnection();
         return;
@@ -557,7 +614,19 @@ class BluetoothChatService {
         .add(IncomingTransfer(fileName: safeName, filePath: filePath));
   }
 
-  Future<void> _teardownConnection() async {
+  Future<void> _teardownConnection({
+    SecureChannelState resultingState = SecureChannelState.idle,
+  }) async {
+    // Bump the epoch and resolve any outstanding trust-prompt completer
+    // *before* the first await below, so that if _onHandshakeComplete is
+    // currently suspended on `await completer.future` for this session, its
+    // continuation (which runs as a microtask once we yield) sees the new
+    // epoch and bails out instead of trying to establish or re-tear-down a
+    // session that no longer exists.
+    _connectionEpoch++;
+    _pendingTrustDecision?.complete(false);
+    _pendingTrustDecision = null;
+
     final peripheral = _connectedPeripheral;
     if (peripheral != null) {
       try {
@@ -584,10 +653,13 @@ class BluetoothChatService {
     _connectedPeerIdentityPublicKey = null;
     _pendingDeviceInfo = null;
 
-    _setChannelState(SecureChannelState.idle);
+    _setChannelState(resultingState);
   }
 
   Future<void> dispose() async {
+    _pendingTrustDecision?.complete(false);
+    _pendingTrustDecision = null;
+
     await _discoverySubscription?.cancel();
     await _notifiedSubscription?.cancel();
     await _writeRequestedSubscription?.cancel();
