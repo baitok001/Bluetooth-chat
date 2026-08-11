@@ -221,8 +221,25 @@ class BluetoothChatService {
       // startDiscovery() below throw an opaque plugin error — means the
       // caller gets a catchable, understandable failure instead of a silent
       // stuck "scanning" state.
+      //
+      // Only reject states that definitely mean "can't proceed" — powered
+      // off, unsupported hardware, or denied authorization. `unknown` is
+      // deliberately allowed through: CentralManager starts in `unknown`
+      // immediately after construction and only resolves to a real value
+      // after an async platform round-trip (and on iOS, CoreBluetooth
+      // itself reports `.unknown` until the delegate callback fires) — on
+      // platforms that skip the Android permission-request round-trip
+      // above, there's often not enough elapsed time for it to have
+      // resolved by the time this check runs, and treating `unknown` as a
+      // failure would spuriously reject a perfectly working adapter on
+      // first launch.
       final adapterState = _centralManager.state;
-      if (adapterState != BluetoothLowEnergyState.poweredOn) {
+      const unavailableAdapterStates = {
+        BluetoothLowEnergyState.poweredOff,
+        BluetoothLowEnergyState.unsupported,
+        BluetoothLowEnergyState.unauthorized,
+      };
+      if (unavailableAdapterStates.contains(adapterState)) {
         throw StateError(
           'Bluetooth is not available (adapter state: $adapterState). '
           'Turn Bluetooth on and try again.',
@@ -371,7 +388,17 @@ class BluetoothChatService {
       throw Exception('No peripheral handle for this device');
     }
 
-    _connectionEpoch++;
+    // Captured once, right after incrementing, and rechecked after every
+    // `await` below. `connect()` (and every step after it) can take long
+    // enough for the handshake watchdog to fire, or for a disconnect event
+    // to land, while this method is suspended — either of which tears the
+    // *attempt* down (bumping the epoch) without ever seeing
+    // `_connectedPeripheral` set (it isn't assigned until `connect()`
+    // returns). If that happens, this call must not resurrect a session
+    // nobody's tracking anymore, and must not tear down whatever newer
+    // session has since taken the slot — same discipline already used in
+    // _onHandshakeComplete for the trust-decision race.
+    final epoch = ++_connectionEpoch;
     _pendingDeviceInfo = deviceInfo;
     _setChannelState(SecureChannelState.handshaking);
     _armHandshakeWatchdog();
@@ -382,16 +409,28 @@ class BluetoothChatService {
     // with the busy slot still claimed (state stuck at `handshaking`,
     // advertising/discovery both stopped, and no disconnect event able to
     // rescue it once `_connectedPeripheral` has been assigned). Every
-    // failure path here must go through _teardownConnection so the slot is
-    // always released.
+    // failure path here must go through _teardownConnection (when this
+    // attempt is still the live one) so the slot is always released.
     try {
       await _centralManager.connect(peripheral);
-      // Assigned as soon as the physical link exists so that any failure
-      // from this point on can be cleaned up (and the peer disconnected)
-      // by _teardownConnection.
+      if (epoch != _connectionEpoch) {
+        // Superseded while connect() was in flight — a newer session may
+        // already be live in the instance fields. Don't touch any shared
+        // state; just release the physical link this call opened.
+        await _disconnectQuietly(peripheral);
+        return;
+      }
+      // Assigned as soon as the physical link exists (and this attempt is
+      // confirmed still current) so that any failure from this point on
+      // can be cleaned up (and the peer disconnected) by
+      // _teardownConnection.
       _connectedPeripheral = peripheral;
 
       final services = await _centralManager.discoverGATT(peripheral);
+      if (epoch != _connectionEpoch) {
+        await _disconnectQuietly(peripheral);
+        return;
+      }
 
       GATTCharacteristic? characteristic;
       for (final service in services) {
@@ -406,7 +445,11 @@ class BluetoothChatService {
       }
 
       if (characteristic == null) {
-        await _teardownConnection(resultingState: SecureChannelState.failed);
+        if (epoch == _connectionEpoch) {
+          await _teardownConnection(resultingState: SecureChannelState.failed);
+        } else {
+          await _disconnectQuietly(peripheral);
+        }
         return;
       }
 
@@ -417,6 +460,10 @@ class BluetoothChatService {
         characteristic,
         state: true,
       );
+      if (epoch != _connectionEpoch) {
+        await _disconnectQuietly(peripheral);
+        return;
+      }
 
       connectedDevice = BluetoothDeviceInfo(
         id: deviceInfo.id,
@@ -441,9 +488,29 @@ class BluetoothChatService {
       );
 
       await _secureChannel!.start();
+      if (epoch != _connectionEpoch) {
+        // Superseded during the handshake start. Don't call
+        // _teardownConnection here — it would tear down whatever newer
+        // session now occupies these fields. Just release this call's own
+        // physical link.
+        await _disconnectQuietly(peripheral);
+        return;
+      }
     } catch (_) {
-      await _teardownConnection(resultingState: SecureChannelState.failed);
+      if (epoch == _connectionEpoch) {
+        await _teardownConnection(resultingState: SecureChannelState.failed);
+      } else {
+        await _disconnectQuietly(peripheral);
+      }
       rethrow;
+    }
+  }
+
+  Future<void> _disconnectQuietly(Peripheral peripheral) async {
+    try {
+      await _centralManager.disconnect(peripheral);
+    } catch (_) {
+      // Already disconnected — safe to ignore.
     }
   }
 
@@ -649,7 +716,15 @@ class BluetoothChatService {
       bleId: _pendingDeviceInfo?.id,
       displayName: _pendingDeviceInfo?.name,
     );
-    if (epoch != _connectionEpoch) {
+    // Re-checked here, not just at entry: dispose() can run *during* the
+    // await above. `_disposed` isn't covered by the epoch (dispose() never
+    // bumps it — it just resolves whatever completer already existed and
+    // closes the controllers), so without this explicit check we could
+    // reach `_trustPromptController.add()` on an already-closed controller
+    // (StateError) or create a brand-new completer that dispose() has no
+    // way to ever resolve (it only resolves the completer that existed at
+    // the moment it ran), hanging `await completer.future` forever.
+    if (_disposed || epoch != _connectionEpoch) {
       return;
     }
 
@@ -669,11 +744,13 @@ class BluetoothChatService {
       ));
 
       final accepted = await completer.future;
-      if (epoch != _connectionEpoch) {
-        // The session was already torn down (e.g. the peer disconnected)
-        // while the trust prompt was outstanding. _teardownConnection()
-        // already resolved _pendingTrustDecision and reset state; there's
-        // nothing left here to establish or tear down again.
+      if (_disposed || epoch != _connectionEpoch) {
+        // Either the session was already torn down (e.g. the peer
+        // disconnected) while the trust prompt was outstanding —
+        // _teardownConnection() already resolved _pendingTrustDecision and
+        // reset state, nothing left to do — or dispose() resolved this
+        // completer directly; either way there's nothing safe left to
+        // touch here.
         return;
       }
       if (!accepted) {
