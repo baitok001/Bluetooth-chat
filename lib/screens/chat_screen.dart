@@ -105,6 +105,7 @@ class _ChatScreenState extends State<ChatScreen> {
         );
     });
 
+    _service.setLocalDisplayName(_myProfile.name);
     await _loadNearbyDevices();
   }
 

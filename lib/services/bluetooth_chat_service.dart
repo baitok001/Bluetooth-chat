@@ -3,27 +3,33 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/secure_channel_state.dart';
+import 'ble_connection_policy.dart';
 import 'bluetooth_frame_codec.dart';
 import 'identity_service.dart';
 import 'secure_channel_service.dart';
 import 'trust_store_service.dart';
 
+final UUID _serviceUUID =
+    UUID.fromString('d48df736-d5d0-4062-ad79-61aec0b78073');
+final UUID _characteristicUUID =
+    UUID.fromString('fdaabf64-712f-41b7-b04c-b7502b38a8f7');
+
 class BluetoothDeviceInfo {
   final String id;
   final String name;
   final bool isConnected;
-  final BluetoothDevice? device;
+  final Peripheral? peripheral;
 
   const BluetoothDeviceInfo({
     required this.id,
     required this.name,
     required this.isConnected,
-    this.device,
+    this.peripheral,
   });
 }
 
@@ -63,6 +69,8 @@ class BluetoothChatService {
 
   final IdentityService _identityService;
   final TrustStoreService _trustStore;
+  final CentralManager _centralManager = CentralManager();
+  final PeripheralManager _peripheralManager = PeripheralManager();
 
   BluetoothChatService({
     IdentityService? identityService,
@@ -84,11 +92,23 @@ class BluetoothChatService {
   Stream<SecureChannelState> get channelStateChanges => _channelStateController.stream;
   Stream<TrustPromptEvent> get trustPrompts => _trustPromptController.stream;
 
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _transferCharacteristic;
-  StreamSubscription<List<int>>? _notifySubscription;
-  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  bool _initialized = false;
+  String _localDisplayName = 'Nearby device';
+  late final GATTCharacteristic _localCharacteristic;
   Directory? _downloadsDir;
+
+  StreamSubscription<DiscoveredEventArgs>? _discoverySubscription;
+  StreamSubscription<GATTCharacteristicNotifiedEventArgs>? _notifiedSubscription;
+  StreamSubscription<GATTCharacteristicWriteRequestedEventArgs>?
+      _writeRequestedSubscription;
+  StreamSubscription<PeripheralConnectionStateChangedEventArgs>?
+      _centralManagerConnectionSubscription;
+  StreamSubscription<CentralConnectionStateChangedEventArgs>?
+      _peripheralManagerConnectionSubscription;
+
+  Peripheral? _connectedPeripheral;
+  GATTCharacteristic? _remoteCharacteristic;
+  Central? _connectedCentral;
 
   BluetoothFrameCodec? _frameCodec;
   SecureChannelService? _secureChannel;
@@ -99,76 +119,276 @@ class BluetoothChatService {
 
   Uint8List? get connectedPeerIdentityPublicKey => _connectedPeerIdentityPublicKey;
 
+  void setLocalDisplayName(String name) {
+    if (name.trim().isNotEmpty) {
+      _localDisplayName = name.trim();
+    }
+  }
+
   Future<void> initialize() async {
+    if (_initialized) {
+      return;
+    }
+    _initialized = true;
+
     if (Platform.isAndroid) {
       await Permission.bluetooth.request();
       await Permission.bluetoothScan.request();
       await Permission.bluetoothConnect.request();
+      await Permission.bluetoothAdvertise.request();
       await Permission.locationWhenInUse.request();
     }
 
-    await FlutterBluePlus.turnOn();
     _downloadsDir ??= await getApplicationDocumentsDirectory();
     await _trustStore.initialize();
+
+    _localCharacteristic = GATTCharacteristic.mutable(
+      uuid: _characteristicUUID,
+      properties: const [
+        GATTCharacteristicProperty.write,
+        GATTCharacteristicProperty.writeWithoutResponse,
+        GATTCharacteristicProperty.notify,
+      ],
+      permissions: const [GATTCharacteristicPermission.write],
+      descriptors: const [],
+    );
+
+    _writeRequestedSubscription = _peripheralManager.characteristicWriteRequested
+        .listen(_handleCharacteristicWriteRequested);
+    _peripheralManagerConnectionSubscription = _peripheralManager
+        .connectionStateChanged
+        .listen(_handlePeripheralManagerConnectionStateChanged);
+
+    _notifiedSubscription =
+        _centralManager.characteristicNotified.listen(_handleCharacteristicNotified);
+    _centralManagerConnectionSubscription = _centralManager.connectionStateChanged
+        .listen(_handleCentralManagerConnectionStateChanged);
+
+    await _startHostingAndDiscovery();
+  }
+
+  Future<void> _startHostingAndDiscovery() async {
+    await _peripheralManager.removeAllServices();
+    await _peripheralManager.addService(
+      GATTService(
+        uuid: _serviceUUID,
+        isPrimary: true,
+        includedServices: const [],
+        characteristics: [_localCharacteristic],
+      ),
+    );
+    await _peripheralManager.startAdvertising(
+      Advertisement(name: _localDisplayName, serviceUUIDs: [_serviceUUID]),
+    );
+
+    discoveredDevices.clear();
+    await _discoverySubscription?.cancel();
+    _discoverySubscription = _centralManager.discovered.listen(_handleDiscovered);
+    await _centralManager.startDiscovery(serviceUUIDs: [_serviceUUID]);
+  }
+
+  Future<void> _pauseHostingAndDiscovery() async {
+    await _discoverySubscription?.cancel();
+    _discoverySubscription = null;
+    try {
+      await _centralManager.stopDiscovery();
+    } catch (_) {
+      // Already stopped or unsupported in this state — safe to ignore.
+    }
+    try {
+      await _peripheralManager.stopAdvertising();
+    } catch (_) {
+      // Already stopped — safe to ignore.
+    }
+  }
+
+  void _handleDiscovered(DiscoveredEventArgs args) {
+    final id = args.peripheral.uuid.toString();
+    final advertisedName = args.advertisement.name;
+    final name =
+        (advertisedName != null && advertisedName.isNotEmpty) ? advertisedName : id;
+    final info = BluetoothDeviceInfo(
+      id: id,
+      name: name,
+      isConnected: false,
+      peripheral: args.peripheral,
+    );
+
+    final existingIndex = discoveredDevices.indexWhere((d) => d.id == id);
+    if (existingIndex >= 0) {
+      discoveredDevices[existingIndex] = info;
+    } else {
+      discoveredDevices.add(info);
+    }
   }
 
   Future<void> startScanning() async {
+    if (!isChannelAvailable(_channelState)) {
+      return;
+    }
     discoveredDevices.clear();
-    await _scanSubscription?.cancel();
-
-    _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
-      final devices = <BluetoothDeviceInfo>{};
-      for (final result in results) {
-        final device = result.device;
-        final id = device.remoteId.toString();
-        final name = device.platformName.isNotEmpty ? device.platformName : id;
-        devices.add(
-          BluetoothDeviceInfo(id: id, name: name, isConnected: false, device: device),
-        );
-      }
-      discoveredDevices
-        ..clear()
-        ..addAll(devices.toList());
-    });
-
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
-    await Future<void>.delayed(const Duration(milliseconds: 500));
-    await FlutterBluePlus.stopScan();
-    await _scanSubscription?.cancel();
-    _scanSubscription = null;
+    try {
+      await _centralManager.stopDiscovery();
+    } catch (_) {
+      // Not currently discovering — safe to ignore.
+    }
+    await _centralManager.startDiscovery(serviceUUIDs: [_serviceUUID]);
   }
 
   Future<void> connectToDevice(BluetoothDeviceInfo deviceInfo) async {
-    await _notifySubscription?.cancel();
-    _pendingDeviceInfo = deviceInfo;
-    _device = deviceInfo.device ?? BluetoothDevice.fromId(deviceInfo.id);
-    await _device!.connect(timeout: const Duration(seconds: 15));
+    if (!shouldAllowOutgoingConnection(_channelState)) {
+      return;
+    }
+    final peripheral = deviceInfo.peripheral;
+    if (peripheral == null) {
+      throw Exception('No peripheral handle for this device');
+    }
 
-    final services = await _device!.discoverServices();
+    _pendingDeviceInfo = deviceInfo;
+    _setChannelState(SecureChannelState.handshaking);
+
+    await _centralManager.connect(peripheral);
+    final services = await _centralManager.discoverGATT(peripheral);
+
+    GATTCharacteristic? characteristic;
     for (final service in services) {
-      for (final characteristic in service.characteristics) {
-        if (characteristic.properties.write && characteristic.properties.notify) {
-          _transferCharacteristic = characteristic;
-          break;
+      if (service.uuid != _serviceUUID) {
+        continue;
+      }
+      for (final candidate in service.characteristics) {
+        if (candidate.uuid == _characteristicUUID) {
+          characteristic = candidate;
         }
       }
-      if (_transferCharacteristic != null) {
-        break;
-      }
     }
 
-    if (_transferCharacteristic == null) {
-      throw Exception('No compatible characteristic found');
+    if (characteristic == null) {
+      _setChannelState(SecureChannelState.failed);
+      await _centralManager.disconnect(peripheral);
+      return;
     }
 
-    await _transferCharacteristic!.setNotifyValue(true);
+    _connectedPeripheral = peripheral;
+    _remoteCharacteristic = characteristic;
+
+    await _centralManager.setCharacteristicNotifyState(
+      peripheral,
+      characteristic,
+      state: true,
+    );
 
     connectedDevice = BluetoothDeviceInfo(
       id: deviceInfo.id,
       name: deviceInfo.name,
       isConnected: true,
-      device: _device,
+      peripheral: peripheral,
     );
+
+    _frameCodec = BluetoothFrameCodec(onFrame: (type, payload) {
+      _secureChannel?.receiveFrame(type, payload);
+    });
+
+    _secureChannel = SecureChannelService(
+      identityService: _identityService,
+      isInitiator: true,
+      sendFrame: (type, payload) =>
+          _sendAsCentral(BluetoothFrameCodec.encode(type, payload)),
+      onHandshakeComplete: (result) => _onHandshakeComplete(result),
+      onHandshakeFailed: (reason) => _setChannelState(SecureChannelState.failed),
+      onData: (data) => _handleDecryptedData(data),
+      onChannelError: (reason) => _setChannelState(SecureChannelState.failed),
+    );
+
+    await _secureChannel!.start();
+  }
+
+  Future<void> _sendAsCentral(Uint8List bytes) async {
+    final peripheral = _connectedPeripheral;
+    final characteristic = _remoteCharacteristic;
+    if (peripheral == null || characteristic == null) {
+      return;
+    }
+    final maxLength = await _centralManager.getMaximumWriteLength(
+      peripheral,
+      type: GATTCharacteristicWriteType.withoutResponse,
+    );
+    var offset = 0;
+    while (offset < bytes.length) {
+      final end =
+          (offset + maxLength < bytes.length) ? offset + maxLength : bytes.length;
+      await _centralManager.writeCharacteristic(
+        peripheral,
+        characteristic,
+        value: bytes.sublist(offset, end),
+        type: GATTCharacteristicWriteType.withoutResponse,
+      );
+      offset = end;
+    }
+  }
+
+  void _handleCharacteristicNotified(GATTCharacteristicNotifiedEventArgs args) {
+    final peripheral = _connectedPeripheral;
+    if (peripheral == null || args.peripheral.uuid != peripheral.uuid) {
+      return;
+    }
+    if (args.characteristic.uuid != _characteristicUUID) {
+      return;
+    }
+    _frameCodec?.feed(args.value);
+  }
+
+  void _handleCentralManagerConnectionStateChanged(
+    PeripheralConnectionStateChangedEventArgs args,
+  ) {
+    final peripheral = _connectedPeripheral;
+    if (peripheral == null || args.peripheral.uuid != peripheral.uuid) {
+      return;
+    }
+    if (args.state == ConnectionState.disconnected) {
+      unawaited(_teardownConnection());
+    }
+  }
+
+  Future<void> _handleCharacteristicWriteRequested(
+    GATTCharacteristicWriteRequestedEventArgs args,
+  ) async {
+    if (args.characteristic.uuid != _characteristicUUID) {
+      return;
+    }
+
+    if (_connectedCentral == null) {
+      if (!shouldAcceptIncomingConnection(_channelState)) {
+        await _peripheralManager.respondWriteRequestWithError(
+          args.request,
+          error: GATTError.insufficientResources,
+        );
+        return;
+      }
+      _startPeripheralSession(args.central);
+    }
+
+    final connectedCentral = _connectedCentral;
+    if (connectedCentral == null || args.central.uuid != connectedCentral.uuid) {
+      await _peripheralManager.respondWriteRequestWithError(
+        args.request,
+        error: GATTError.insufficientResources,
+      );
+      return;
+    }
+
+    await _peripheralManager.respondWriteRequest(args.request);
+    _frameCodec?.feed(args.request.value);
+  }
+
+  void _startPeripheralSession(Central central) {
+    _connectedCentral = central;
+    final deviceInfo = BluetoothDeviceInfo(
+      id: central.uuid.toString(),
+      name: 'Nearby device',
+      isConnected: true,
+    );
+    _pendingDeviceInfo = deviceInfo;
+    connectedDevice = deviceInfo;
 
     _setChannelState(SecureChannelState.handshaking);
 
@@ -178,21 +398,45 @@ class BluetoothChatService {
 
     _secureChannel = SecureChannelService(
       identityService: _identityService,
-      isInitiator: true,
-      sendFrame: (type, payload) async {
-        await _writeBytes(BluetoothFrameCodec.encode(type, payload));
-      },
+      isInitiator: false,
+      sendFrame: (type, payload) =>
+          _sendAsPeripheral(BluetoothFrameCodec.encode(type, payload)),
       onHandshakeComplete: (result) => _onHandshakeComplete(result),
       onHandshakeFailed: (reason) => _setChannelState(SecureChannelState.failed),
       onData: (data) => _handleDecryptedData(data),
       onChannelError: (reason) => _setChannelState(SecureChannelState.failed),
     );
+  }
 
-    _notifySubscription = _transferCharacteristic!.lastValueStream.listen((data) {
-      _frameCodec?.feed(data);
-    });
+  Future<void> _sendAsPeripheral(Uint8List bytes) async {
+    final central = _connectedCentral;
+    if (central == null) {
+      return;
+    }
+    final maxLength = await _peripheralManager.getMaximumNotifyLength(central);
+    var offset = 0;
+    while (offset < bytes.length) {
+      final end =
+          (offset + maxLength < bytes.length) ? offset + maxLength : bytes.length;
+      await _peripheralManager.notifyCharacteristic(
+        central,
+        _localCharacteristic,
+        value: bytes.sublist(offset, end),
+      );
+      offset = end;
+    }
+  }
 
-    await _secureChannel!.start();
+  void _handlePeripheralManagerConnectionStateChanged(
+    CentralConnectionStateChangedEventArgs args,
+  ) {
+    final central = _connectedCentral;
+    if (central == null || args.central.uuid != central.uuid) {
+      return;
+    }
+    if (args.state == ConnectionState.disconnected) {
+      unawaited(_teardownConnection());
+    }
   }
 
   Future<void> _onHandshakeComplete(HandshakeResult result) async {
@@ -220,7 +464,6 @@ class BluetoothChatService {
 
       final accepted = await completer.future;
       if (!accepted) {
-        _setChannelState(SecureChannelState.failed);
         await _teardownConnection();
         return;
       }
@@ -242,8 +485,16 @@ class BluetoothChatService {
   }
 
   void _setChannelState(SecureChannelState state) {
+    final wasAvailable = isChannelAvailable(_channelState);
     _channelState = state;
     _channelStateController.add(state);
+
+    final isAvailable = isChannelAvailable(state);
+    if (wasAvailable && !isAvailable) {
+      unawaited(_pauseHostingAndDiscovery());
+    } else if (!wasAvailable && isAvailable) {
+      unawaited(_startHostingAndDiscovery());
+    }
   }
 
   Future<void> sendMessage(String text) async {
@@ -302,33 +553,67 @@ class BluetoothChatService {
     final filePath = '${_downloadsDir!.path}/$safeName';
     final file = File(filePath);
     await file.writeAsBytes(fileBytes, flush: true);
-    _incomingTransferController.add(IncomingTransfer(fileName: safeName, filePath: filePath));
-  }
-
-  Future<void> _writeBytes(List<int> data) async {
-    if (_transferCharacteristic == null) {
-      return;
-    }
-    await _transferCharacteristic!.write(data, withoutResponse: false);
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+    _incomingTransferController
+        .add(IncomingTransfer(fileName: safeName, filePath: filePath));
   }
 
   Future<void> _teardownConnection() async {
-    await _notifySubscription?.cancel();
-    _notifySubscription = null;
-    await _device?.disconnect();
-    _device = null;
-    _transferCharacteristic = null;
+    final peripheral = _connectedPeripheral;
+    if (peripheral != null) {
+      try {
+        await _centralManager.disconnect(peripheral);
+      } catch (_) {
+        // Already disconnected — safe to ignore.
+      }
+    }
+    final central = _connectedCentral;
+    if (central != null) {
+      try {
+        await _peripheralManager.disconnect(central);
+      } catch (_) {
+        // Already disconnected — safe to ignore.
+      }
+    }
+
+    _connectedPeripheral = null;
+    _remoteCharacteristic = null;
+    _connectedCentral = null;
     _secureChannel = null;
     _frameCodec = null;
     connectedDevice = null;
     _connectedPeerIdentityPublicKey = null;
+    _pendingDeviceInfo = null;
+
+    _setChannelState(SecureChannelState.idle);
   }
 
   Future<void> dispose() async {
-    await _notifySubscription?.cancel();
-    await _scanSubscription?.cancel();
-    await _device?.disconnect();
+    await _discoverySubscription?.cancel();
+    await _notifiedSubscription?.cancel();
+    await _writeRequestedSubscription?.cancel();
+    await _centralManagerConnectionSubscription?.cancel();
+    await _peripheralManagerConnectionSubscription?.cancel();
+
+    final peripheral = _connectedPeripheral;
+    if (peripheral != null) {
+      try {
+        await _centralManager.disconnect(peripheral);
+      } catch (_) {
+        // Already disconnected — safe to ignore.
+      }
+    }
+
+    try {
+      await _centralManager.stopDiscovery();
+    } catch (_) {
+      // Not discovering — safe to ignore.
+    }
+    try {
+      await _peripheralManager.stopAdvertising();
+    } catch (_) {
+      // Not advertising — safe to ignore.
+    }
+
     await _incomingTextController.close();
     await _incomingTransferController.close();
     await _channelStateController.close();
