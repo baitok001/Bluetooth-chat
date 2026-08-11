@@ -93,6 +93,14 @@ class BluetoothChatService {
   Stream<TrustPromptEvent> get trustPrompts => _trustPromptController.stream;
 
   bool _initialized = false;
+  // The in-flight initialize() run, if any. Lets a second concurrent call to
+  // initialize() (e.g. a double-tapped refresh button) await the same run
+  // instead of starting the side-effecting setup (permission requests, GATT
+  // service/advertising setup, stream subscriptions) a second time in
+  // parallel. Cleared once that run finishes, success or failure, so a call
+  // made after a genuine failure starts a fresh attempt rather than being
+  // stuck replaying a dead future.
+  Future<void>? _initializing;
   String _localDisplayName = 'Nearby device';
   // Nullable (not `late final`) so a failed `initialize()` can be retried
   // without hitting a "already initialized" LateInitializationError; built
@@ -135,16 +143,30 @@ class BluetoothChatService {
     }
   }
 
-  Future<void> initialize() async {
+  // Deliberately not `async`: the guard checks below must run synchronously
+  // (no `await` before them) so that two back-to-back calls to initialize()
+  // can never both pass the `_initialized`/`_initializing` checks before
+  // either one has registered itself — Dart won't preempt this function
+  // between the check and the `_initializing ??= ...` assignment.
+  Future<void> initialize() {
     if (_initialized) {
-      return;
+      return Future<void>.value();
     }
+    // If a run is already in flight, piggyback on it instead of starting a
+    // second concurrent run of the side-effecting setup below. `??=` only
+    // evaluates/assigns _doInitialize() when _initializing is currently
+    // null, so this is the reentrancy guard.
+    return _initializing ??= _doInitialize();
+  }
 
+  Future<void> _doInitialize() async {
     // `_initialized` is only flipped to true once every step below has
     // succeeded. If anything throws (e.g. a permission request fails on an
     // odd platform, or the trust store can't open its database), it's reset
     // so the caller can retry by calling initialize() again from scratch
     // instead of being permanently stuck with a half-initialized service.
+    // `_initializing` is cleared in `finally` either way, so a retry after a
+    // genuine failure starts a fresh run rather than reusing a dead future.
     try {
       if (Platform.isAndroid) {
         await Permission.bluetooth.request();
@@ -189,6 +211,8 @@ class BluetoothChatService {
     } catch (_) {
       _initialized = false;
       rethrow;
+    } finally {
+      _initializing = null;
     }
   }
 
