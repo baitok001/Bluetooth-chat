@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import 'screens/chat_screen.dart';
 
@@ -11,6 +12,11 @@ class BluetoothChatApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final baseTextTheme = Typography.material2021().black.apply(
+      bodyColor: const Color(0xFF1E1B3A),
+      displayColor: const Color(0xFF1E1B3A),
+    );
+
     return MaterialApp(
       title: 'Nearby Chat',
       debugShowCheckedModeBanner: false,
@@ -22,10 +28,7 @@ class BluetoothChatApp extends StatelessWidget {
           foregroundColor: Color(0xFF1E1B3A),
           elevation: 0,
         ),
-        textTheme: Typography.material2021().black.apply(
-          bodyColor: const Color(0xFF1E1B3A),
-          displayColor: const Color(0xFF1E1B3A),
-        ),
+        textTheme: GoogleFonts.plusJakartaSansTextTheme(baseTextTheme),
         useMaterial3: true,
       ),
       home: const ChatScreen(),

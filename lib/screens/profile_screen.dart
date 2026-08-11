@@ -86,31 +86,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
               const Text('В сети • доступен для общения',
                   style: TextStyle(color: Colors.grey, fontSize: 14)),
               const SizedBox(height: 24),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF111827),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Премиум-план',
-                        style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w800,
-                            fontSize: 16)),
-                    const SizedBox(height: 8),
-                    const Text('• Безлимитные Bluetooth-сессии',
-                        style: TextStyle(color: Colors.white70)),
-                    const Text('• Облачное резервное копирование',
-                        style: TextStyle(color: Colors.white70)),
-                    const Text('• Премиум-стили и скрытые темы',
-                        style: TextStyle(color: Colors.white70)),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 24),
               ElevatedButton.icon(
                 onPressed: _pickAvatar,
                 icon: const Icon(Icons.photo_camera_outlined),
